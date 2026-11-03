@@ -1,13 +1,21 @@
 import time
 import os
+import math
+import threading
 from ortools.sat.python import cp_model
 import pandas as pd
 from engine.logger import log_step, log_info, log_success, log_warning, log_error
+from engine.input_utils import integer
+from engine.cancellation import check_cancelled
+from engine.validator import PreSolverValidator
 
 class TimetableCPSATSolver:
-    """Google OR-Tools CP-SAT solver implementing the specification in timetable-generator-planning-report.md."""
+    """Schedule class sessions with teacher and lab-room constraints."""
 
     def __init__(self, data):
+        errors = PreSolverValidator.validate(data)
+        if errors:
+            raise ValueError("Invalid timetable input:\n" + "\n".join(errors))
         self.data = data
         self.days = data.working_days
         self.periods_per_day = data.periods_per_day
@@ -48,11 +56,15 @@ class TimetableCPSATSolver:
             for _, row in data.unavailability.iterrows():
                 t_id = str(row["teacher_id"]).strip()
                 d = str(row["day"]).strip()
-                p = int(row["period"])
+                p = integer(row["period"], "TeacherUnavailability period", 1)
                 if (d, p) in self.inverse_slot_map:
                     self.teacher_unavail_slots.add((t_id, self.inverse_slot_map[(d, p)]))
 
-    def solve(self, time_limit_seconds=30):
+    def solve(self, time_limit_seconds=30, cancel_event=None):
+        check_cancelled(cancel_event)
+        time_limit_seconds = float(time_limit_seconds)
+        if not math.isfinite(time_limit_seconds) or time_limit_seconds <= 0:
+            raise ValueError("Solver time limit must be a positive, finite number of seconds.")
         log_step("⚡ Step 3: Formulating Google OR-Tools CP-SAT Model")
         start_solve_time = time.time()
         model = cp_model.CpModel()
@@ -61,6 +73,7 @@ class TimetableCPSATSolver:
         session_id = 0
 
         for _, row in self.data.assignments.iterrows():
+            check_cancelled(cancel_event)
             c_id = str(row["class_id"])
             s_id = str(row["subject_id"])
             t_id = str(row["teacher_id"])
@@ -69,9 +82,9 @@ class TimetableCPSATSolver:
             if s_row is None:
                 continue
 
-            t_count = int(s_row["theory_sessions_per_week"])
-            l_count = int(s_row["lab_sessions_per_week"])
-            priority = int(s_row.get("priority", 2))
+            t_count = integer(s_row["theory_sessions_per_week"], "theory_sessions_per_week")
+            l_count = integer(s_row["lab_sessions_per_week"], "lab_sessions_per_week")
+            priority = integer(s_row.get("priority", 2), "priority", 1, 3)
             req_lab_cat = str(s_row.get("lab_room_category", "")).strip()
 
             for _ in range(t_count):
@@ -116,6 +129,7 @@ class TimetableCPSATSolver:
                 lab_rooms_by_cat.setdefault(cat, []).append(r_id)
 
         for sess in sessions:
+            check_cancelled(cancel_event)
             sid = sess["id"]
             c_id = sess["class_id"]
             t_id = sess["teacher_id"]
@@ -153,9 +167,12 @@ class TimetableCPSATSolver:
 
             if stype == "lab":
                 cat = sess["req_lab_cat"]
-                cand_rooms = lab_rooms_by_cat.get(cat, [])
+                cand_rooms = (lab_rooms_by_cat.get(cat, []) if cat else
+                              [r for ids in lab_rooms_by_cat.values() for r in ids])
+                strength = integer(self.classes_map[c_id]["strength"], "strength", 1)
+                cand_rooms = [r for r in cand_rooms if integer(self.rooms_map[r]["capacity"], "capacity", 1) >= strength]
                 if not cand_rooms:
-                    cand_rooms = [r for r, r_row in self.rooms_map.items() if str(r_row.get("type", "")).lower() == "lab"]
+                    raise ValueError(f"No suitable lab room for class {c_id}, subject {sess['subject_id']}.")
 
                 room_lits = []
                 for r_id in cand_rooms:
@@ -165,12 +182,11 @@ class TimetableCPSATSolver:
                     sess_info["room_literals"][r_id] = r_lit
                     room_lits.append(r_lit)
 
-                if room_lits:
-                    model.AddExactlyOne(room_lits)
+                model.AddExactlyOne(room_lits)
 
             session_vars[sid] = sess_info
 
-        log_info("Formulated 12 Hard Constraints (Class, Teacher & Room NoOverlap, Lab Block Continuity, Daily Caps, Exclusions)...")
+        log_info("Formulated class, teacher and lab-room constraints, lab continuity and daily caps.")
 
         # 1. Class No-Overlap
         for c_id, intervals in class_intervals.items():
@@ -191,6 +207,7 @@ class TimetableCPSATSolver:
         day_slot_indices = {day: [self.inverse_slot_map[(day, p)] for p in range(1, self.periods_per_day + 1)] for day in self.days}
 
         for c_id in self.classes_map:
+            check_cancelled(cancel_event)
             c_sessions = [s for s in sessions if s["class_id"] == c_id]
             c_labs = [s for s in c_sessions if s["type"] == "lab"]
 
@@ -227,56 +244,39 @@ class TimetableCPSATSolver:
 
         # 7. Teacher Daily Max Periods
         for t_id, t_row in self.teachers_map.items():
-            max_d = int(t_row.get("max_periods_day", 5))
+            check_cancelled(cancel_event)
+            max_d = integer(t_row.get("max_periods_day", 5), "max_periods_day")
             t_sessions = [s for s in sessions if s["teacher_id"] == t_id]
 
             for day, d_slots in day_slot_indices.items():
-                slot_occs = []
-                for s_idx in d_slots:
-                    sess_covers = []
-                    for sess in t_sessions:
-                        sid = sess["id"]
-                        start_v = session_vars[sid]["start"]
-                        end_v = session_vars[sid]["end"]
-
-                        b1 = model.NewBoolVar(f"b1_{s_idx}_{sid}")
-                        b2 = model.NewBoolVar(f"b2_{s_idx}_{sid}")
-                        model.Add(start_v <= s_idx).OnlyEnforceIf(b1)
-                        model.Add(start_v > s_idx).OnlyEnforceIf(b1.Not())
-                        model.Add(end_v > s_idx).OnlyEnforceIf(b2)
-                        model.Add(end_v <= s_idx).OnlyEnforceIf(b2.Not())
-
-                        covers = model.NewBoolVar(f"t_{t_id}_cov_{s_idx}_{sid}")
-                        model.AddBoolAnd([b1, b2]).OnlyEnforceIf(covers)
-                        model.AddBoolOr([b1.Not(), b2.Not()]).OnlyEnforceIf(covers.Not())
-                        sess_covers.append(covers)
-
-                    slot_occ = model.NewBoolVar(f"t_occ_{t_id}_{s_idx}")
-                    if sess_covers:
-                        model.Add(sum(sess_covers) >= 1).OnlyEnforceIf(slot_occ)
-                        model.Add(sum(sess_covers) == 0).OnlyEnforceIf(slot_occ.Not())
-                        slot_occs.append(slot_occ)
-
-                if slot_occs:
-                    model.Add(sum(slot_occs) <= max_d)
+                # Sessions cannot cross days, so count their lengths once per day.
+                day_domain = cp_model.Domain.FromIntervals([[min(d_slots), max(d_slots)]])
+                daily_load = []
+                for sess in t_sessions:
+                    sid = sess["id"]
+                    start_v = session_vars[sid]["start"]
+                    on_day = model.NewBoolVar(f"teacher_{t_id}_{sid}_{day}")
+                    model.AddLinearExpressionInDomain(start_v, day_domain).OnlyEnforceIf(on_day)
+                    model.AddLinearExpressionInDomain(start_v, day_domain.complement()).OnlyEnforceIf(on_day.Not())
+                    daily_load.append(on_day * sess["length"])
+                model.Add(sum(daily_load) <= max_d)
 
         # --- SOFT OBJECTIVES ---
         log_info("Formulated Soft Objectives (Subject Priority Rewards, Lunch-Half Balance, Same-Subject Repeat Penalties)...")
         obj_terms = []
 
         for sess in sessions:
+            check_cancelled(cancel_event)
             sid = sess["id"]
             start_v = session_vars[sid]["start"]
             priority = sess["priority"]
             p_weight = (4 - min(priority, 3)) * 10
-            for s_idx, (day, p) in self.slot_map.items():
-                is_at_slot = model.NewBoolVar(f"at_slot_{sid}_{s_idx}")
-                model.Add(start_v == s_idx).OnlyEnforceIf(is_at_slot)
-                model.Add(start_v != s_idx).OnlyEnforceIf(is_at_slot.Not())
-                reward = p_weight * (self.periods_per_day - p)
-                obj_terms.append(is_at_slot * reward)
+            period_index = model.NewIntVar(0, self.periods_per_day - 1, f"period_{sid}")
+            model.AddModuloEquality(period_index, start_v, self.periods_per_day)
+            obj_terms.append(p_weight * (self.periods_per_day - 1 - period_index))
 
         for c_id in self.classes_map:
+            check_cancelled(cancel_event)
             c_sessions = [s for s in sessions if s["class_id"] == c_id]
             subjs_in_class = set(s["subject_id"] for s in c_sessions)
 
@@ -368,22 +368,43 @@ class TimetableCPSATSolver:
         log_step("🚀 Step 4: Executing CP-SAT Solver", f"Time limit: {time_limit_seconds}s")
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_seconds
-        # Parallel search: use all available cores except one (massively improves
-        # the chance of reaching a feasible schedule inside the time limit).
-        workers = max(1, (os.cpu_count() or 2) - 1)
+        # Limit parallel search to keep memory use reasonable on desktop systems.
+        workers = min(4, max(1, (os.cpu_count() or 2) - 1))
         try:
             solver.parameters.num_search_workers = workers
             log_info(f"Solving with {workers} parallel workers.")
         except Exception:
             pass
-        status = solver.Solve(model)
+        check_cancelled(cancel_event)
+        monitor_done = threading.Event()
+
+        def monitor_cancellation():
+            while not monitor_done.wait(0.05):
+                if cancel_event.is_set():
+                    solver.StopSearch()
+
+        monitor = None
+        if cancel_event is not None:
+            monitor = threading.Thread(target=monitor_cancellation, daemon=True)
+            monitor.start()
+        try:
+            status = solver.Solve(model)
+        finally:
+            monitor_done.set()
+            if monitor is not None:
+                monitor.join()
+        check_cancelled(cancel_event)
 
         elapsed = time.time() - start_solve_time
         status_name = solver.StatusName(status)
 
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             log_error(f"Solver returned {status_name} after {elapsed:.2f}s.")
-            raise RuntimeError("CP-SAT solver failed to find a feasible solution under the given constraints.")
+            if status == cp_model.INFEASIBLE:
+                raise RuntimeError("No feasible timetable exists under the supplied constraints. Review loads, availability and rooms.")
+            if status == cp_model.UNKNOWN:
+                raise RuntimeError("The solver stopped before finding a timetable. Increase the time limit and try again; infeasibility has not been proved.")
+            raise RuntimeError(f"CP-SAT returned {status_name}: {solver.ResponseStats()}")
 
         obj_val = solver.ObjectiveValue()
         log_success(f"CP-SAT Solver Status: {status_name} (Solved in {elapsed:.2f}s, Objective Value: {obj_val:.1f}).")
@@ -407,13 +428,9 @@ class TimetableCPSATSolver:
                 slot_idx = start_val + offset
                 day, period = self.slot_map[slot_idx]
                 master_schedule.append({
-                    "class_id": sess["class_id"],
-                    "subject_id": sess["subject_id"],
-                    "teacher_id": sess["teacher_id"],
-                    "room_id": selected_room,
-                    "day": day,
-                    "period": period,
-                    "type": stype
+                    "session_id": sid, "class_id": sess["class_id"],
+                    "subject_id": sess["subject_id"], "teacher_id": sess["teacher_id"],
+                    "room_id": selected_room, "day": day, "period": period, "type": stype
                 })
 
         log_info(f"Extracted {len(master_schedule)} master schedule entries.")

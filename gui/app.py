@@ -1,7 +1,6 @@
-import sys
 import os
-import tempfile
-import pandas as pd
+import html
+import threading
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -12,33 +11,38 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QCursor, QTextDocument
 from PySide6.QtPrintSupport import QPrinter
 
-from engine.scheduler import TimetableScheduler, generate_dummy_template, SchedulerError
+from engine.scheduler import TimetableScheduler, generate_dummy_template
+from engine.data_loader import load_timetable_data
+from engine.cancellation import GenerationCancelled, check_cancelled
+from engine.exporter import TimetableExporter
 from engine.logger import log_step, log_info, log_success
 from gui.theme import COLORS, get_main_stylesheet
 from gui.preview_view import PreviewView
 
 class WorkerThread(QThread):
     """Background thread for timetable generation."""
-    finished = Signal(bool, str)
+    completed = Signal(bool, object)
 
-    def __init__(self, filepath, time_limit_seconds, parent=None):
+    def __init__(self, filepath, time_limit_seconds, config_overrides=None, parent=None):
         super().__init__(parent)
         self.filepath = filepath
         self.time_limit_seconds = time_limit_seconds
+        self.config_overrides = dict(config_overrides or {})
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
 
     def run(self):
         try:
-            scheduler = TimetableScheduler(self.filepath)
-            master_sched, class_grids, teacher_grids = scheduler.solve(
-                time_limit_seconds=self.time_limit_seconds)
-            
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.xlsx')
-            os.close(tmp_fd)
-            scheduler.export_excel(class_grids, teacher_grids, tmp_path)
-            
-            self.finished.emit(True, tmp_path)
+            check_cancelled(self.cancel_event)
+            scheduler = TimetableScheduler(self.filepath, config_overrides=self.config_overrides)
+            master_sched, _, _ = scheduler.solve(
+                time_limit_seconds=self.time_limit_seconds, cancel_event=self.cancel_event)
+            check_cancelled(self.cancel_event)
+            self.completed.emit(True, (master_sched, scheduler.data))
         except Exception as e:
-            self.finished.emit(False, str(e))
+            self.completed.emit(False, GenerationCancelled("Timetable generation cancelled.") if self.cancel_event.is_set() else e)
 
 
 class TimeTableApp(QMainWindow):
@@ -57,6 +61,7 @@ class TimeTableApp(QMainWindow):
 
         self.filepath = None
         self.worker = None
+        self._closing = False
 
         # Apply base stylesheet
         self.setStyleSheet(get_main_stylesheet() + """
@@ -210,7 +215,7 @@ class TimeTableApp(QMainWindow):
         )
         self.file_path_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        browse_btn = QPushButton("Browse")
+        browse_btn = self.browse_btn = QPushButton("Browse")
         browse_btn.setFixedSize(90, 38)
         browse_btn.setStyleSheet(f"background-color: {COLORS['primary']}; color: white; border: none; border-radius: 6px; font-weight: bold;")
         browse_btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -234,7 +239,7 @@ class TimeTableApp(QMainWindow):
         p_row = QHBoxLayout()
         p_lbl = QLabel("Periods per day:")
         self.periods_spin = QSpinBox()
-        self.periods_spin.setRange(1, 15)
+        self.periods_spin.setRange(1, 24)
         self.periods_spin.setValue(8)
         p_row.addWidget(p_lbl)
         p_row.addWidget(self.periods_spin)
@@ -243,11 +248,12 @@ class TimeTableApp(QMainWindow):
         b_row = QHBoxLayout()
         b_lbl = QLabel("Break after Period (0 = None):")
         self.break_spin = QSpinBox()
-        self.break_spin.setRange(0, 15)
+        self.break_spin.setRange(0, self.periods_spin.value())
         self.break_spin.setValue(4)
         b_row.addWidget(b_lbl)
         b_row.addWidget(self.break_spin)
         cfg_section.addLayout(b_row)
+        self.periods_spin.valueChanged.connect(self.break_spin.setMaximum)
 
         t_row = QHBoxLayout()
         t_lbl = QLabel("Solver time limit (seconds):")
@@ -269,6 +275,10 @@ class TimeTableApp(QMainWindow):
         self.generate_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.generate_btn.clicked.connect(self._start_generation)
         layout.addWidget(self.generate_btn)
+        self.cancel_btn = QPushButton("Cancel Generation")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_generation)
+        layout.addWidget(self.cancel_btn)
 
         scroll_area.setWidget(panel)
         outer_layout.addWidget(scroll_area)
@@ -286,16 +296,28 @@ class TimeTableApp(QMainWindow):
             self, "Save Template", "template.xlsx", "Excel Files (*.xlsx)"
         )
         if dest:
-            generate_dummy_template(dest)
-            self.status_label.setText(f"✅ Template saved to {dest}")
-            log_success(f"Template dataset downloaded to: {dest}")
+            try:
+                generate_dummy_template(dest)
+                self.status_label.setText(f"✅ Template saved to {dest}")
+                log_success(f"Template dataset downloaded to: {dest}")
+            except Exception as exc:
+                QMessageBox.critical(self, "Template Failed", str(exc))
 
     def _browse_file(self):
         file_name, _ = QFileDialog.getOpenFileName(
-            self, "Select Dataset", "", "Excel Files (*.xlsx *.csv)"
+            self, "Select Dataset", "", "Excel Files (*.xlsx)"
         )
         if file_name:
+            try:
+                data = load_timetable_data(file_name)
+            except Exception as exc:
+                QMessageBox.critical(self, "Invalid Workbook", str(exc))
+                return
             self.filepath = file_name
+            self.periods_spin.setValue(data.periods_per_day)
+            self.break_spin.setValue(data.break_after_period)
+            self.days_edit.setText(", ".join(data.working_days))
+            self.preview_view._show_empty_state()
             self.file_path_display.setText(os.path.basename(file_name))
             self.export_excel_btn.setEnabled(False)
             self.export_pdf_btn.setEnabled(False)
@@ -314,58 +336,91 @@ class TimeTableApp(QMainWindow):
 
         self.generate_btn.setEnabled(False)
         self.generate_btn.setText("⏳ Generating...")
-
-        self.worker = WorkerThread(self.filepath, self.time_spin.value(), parent=self)
-        self.worker.finished.connect(self._on_generation_finished)
+        self._set_busy(True)
+        overrides = {
+            "working_days": self.days_edit.text(),
+            "periods_per_day": self.periods_spin.value(),
+            "break_after_period": self.break_spin.value(),
+        }
+        self.worker = WorkerThread(self.filepath, self.time_spin.value(), overrides, parent=self)
+        self.worker.completed.connect(self._on_generation_finished)
+        self.worker.finished.connect(self._on_worker_stopped)
         self.worker.start()
 
-    def _on_generation_finished(self, success: bool, result_msg: str):
-        if self.worker is not None:
-            self.worker.wait()
-        self.generate_btn.setEnabled(True)
-        self.generate_btn.setText("⚡ Generate Timetable")
-
+    def _on_generation_finished(self, success: bool, result):
+        if self._closing:
+            return
         if success:
-            self.preview_view.display_plan(result_msg)
-            self.export_excel_btn.setEnabled(True)
-            self.export_pdf_btn.setEnabled(True)
-            self.status_label.setText("✅ Timetable generated!")
-            log_success("Timetable generation completed successfully and rendered in Preview UI.")
+            try:
+                self.preview_view.display_schedule(*result)
+                self.status_label.setText("✅ Timetable generated!")
+                log_success("Timetable generation completed and validated in Preview UI.")
+            except Exception as exc:
+                self.preview_view._show_empty_state()
+                QMessageBox.critical(self, "Preview Failed", str(exc))
+        elif isinstance(result, GenerationCancelled):
+            self.status_label.setText("Generation cancelled.")
         else:
-            QMessageBox.critical(self, "Failed", f"Error:\n{result_msg}")
-            log_info(f"Generation failed: {result_msg}")
+            self.status_label.setText("Generation failed.")
+            QMessageBox.critical(self, "Failed", f"Error:\n{result}")
+            log_info(f"Generation failed: {result}")
+
+    def _set_busy(self, busy):
+        for widget in (self.generate_btn, self.browse_btn, self.template_btn, self.days_edit,
+                       self.periods_spin, self.break_spin, self.time_spin, self.preview_view):
+            widget.setEnabled(not busy)
+        self.cancel_btn.setEnabled(busy)
+        can_export = not busy and self.preview_view.document is not None
+        self.export_excel_btn.setEnabled(can_export)
+        self.export_pdf_btn.setEnabled(can_export)
+
+    def _cancel_generation(self):
+        if self.worker is not None:
+            self.worker.cancel()
+            self.cancel_btn.setEnabled(False)
+            self.status_label.setText("Cancelling generation…")
+
+    def _on_worker_stopped(self):
+        worker = self.worker
+        self.worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self._closing:
+            self.close()
+            return
+        self.generate_btn.setText("⚡ Generate Timetable")
+        self._set_busy(False)
 
     def _export_excel(self):
-        current_excel = self.preview_view.get_current_data_as_excel()
-        if not current_excel: return
-
+        if self.preview_view.document is None:
+            return
         dest, _ = QFileDialog.getSaveFileName(self, "Save Excel", "timetable.xlsx", "Excel Files (*.xlsx)")
         if dest:
-            import shutil
-            shutil.copy(current_excel, dest)
-            self.status_label.setText(f"✅ Exported Excel: {dest}")
-            log_success(f"Exported Excel workbook to: {dest}")
+            try:
+                self.preview_view.document.export_excel(dest)
+                self.status_label.setText(f"✅ Exported Excel: {dest}")
+                log_success(f"Exported Excel workbook to: {dest}")
+            except Exception as exc:
+                QMessageBox.critical(self, "Export Failed", str(exc))
 
     def _export_pdf(self):
-        current_excel = self.preview_view.get_current_data_as_excel()
-        if not current_excel: return
-
+        if self.preview_view.document is None:
+            return
         dest, _ = QFileDialog.getSaveFileName(self, "Save PDF", "timetable.pdf", "PDF Files (*.pdf)")
         if not dest: return
 
         try:
-            xls = pd.ExcelFile(current_excel)
-            html = "<html><head><style>table, th, td {border: 1px solid black; border-collapse: collapse; padding: 5px; text-align: center;}</style></head><body>"
-            html += "<h1>University Timetable</h1>"
-            for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name, index_col=0)
-                html += f"<h2>{sheet_name}</h2>"
-                html += df.to_html()
-                html += "<br><br>"
-            html += "</body></html>"
+            grids = self.preview_view.document.projections()
+            markup = "<html><head><style>table, th, td {border: 1px solid black; border-collapse: collapse; padding: 5px; text-align: center;}</style></head><body>"
+            markup += "<h1>University Timetable</h1>"
+            for sheet_name, df in TimetableExporter.named_grids(*grids):
+                markup += f"<h2>{html.escape(sheet_name)}</h2>"
+                markup += df.to_html()
+                markup += "<br><br>"
+            markup += "</body></html>"
 
             doc = QTextDocument()
-            doc.setHtml(html)
+            doc.setHtml(markup)
             printer = QPrinter()
             printer.setOutputFormat(QPrinter.PdfFormat)
             printer.setOutputFileName(dest)
@@ -377,7 +432,9 @@ class TimeTableApp(QMainWindow):
 
     def closeEvent(self, event):
         if self.worker is not None and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait(1000)
+            self._closing = True
+            self._cancel_generation()
+            event.ignore()
+            return
         event.accept()
 

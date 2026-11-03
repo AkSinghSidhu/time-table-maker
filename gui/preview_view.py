@@ -4,20 +4,17 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QColor
-import pandas as pd
-import tempfile
-import os
-
 from gui.theme import COLORS
-from engine.validator import IndependentValidator
+from engine.schedule import ScheduleDocument
+from engine.exporter import TimetableExporter
 
 class PreviewView(QWidget):
     """Main visualization panel — displays generated datesheet in tabs with real-time validation."""
 
     def __init__(self):
         super().__init__()
-        self.excel_filepath = None
-        self.timetable_data = None
+        self.document = None
+        self.view_keys = []
         self.tables = []
         self._setup_ui()
 
@@ -43,7 +40,8 @@ class PreviewView(QWidget):
         header_layout.addStretch()
 
         # Swap Button
-        self.swap_btn = QPushButton("🔄 Swap Selected Periods")
+        self.swap_btn = QPushButton("🔄 Swap / Move Sessions")
+        self.swap_btn.setToolTip("Select two cells in one view. Labs move as complete two-period blocks; conflicting changes are rejected.")
         self.swap_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {COLORS['primary']};
@@ -88,7 +86,9 @@ class PreviewView(QWidget):
         self._clear_content()
         self.swap_btn.setEnabled(False)
         self.val_banner.hide()
-        self.excel_filepath = None
+        self.document = None
+        self.tables = []
+        self.view_keys = []
 
         empty_widget = QWidget()
         empty_layout = QVBoxLayout(empty_widget)
@@ -115,14 +115,19 @@ class PreviewView(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-    def display_plan(self, excel_filepath):
-        """Load the excel file and display it in tabs."""
+    def display_schedule(self, master_schedule, data):
+        self.document = ScheduleDocument(master_schedule, data)
+        self._render()
+
+    def _render(self, current_index=0):
+        """Render all projections from the same validated schedule."""
         self._clear_content()
-        self.excel_filepath = excel_filepath
         self.tables = []
+        self.view_keys = []
 
         try:
-            xls = pd.ExcelFile(excel_filepath)
+            class_grids, teacher_grids = self.document.projections()
+            self.view_keys = [("class_id", key) for key in class_grids] + [("teacher_id", key) for key in teacher_grids]
 
             self.tab_widget = QTabWidget()
             self.tab_widget.setStyleSheet(f"""
@@ -152,8 +157,7 @@ class PreviewView(QWidget):
                 }}
             """)
 
-            for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name, index_col=0)
+            for sheet_name, df in TimetableExporter.named_grids(class_grids, teacher_grids):
 
                 table = QTableWidget()
                 self.tables.append(table)
@@ -169,6 +173,7 @@ class PreviewView(QWidget):
                         if val == 'nan':
                             val = ""
                         item = QTableWidgetItem(val)
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                         item.setTextAlignment(Qt.AlignCenter)
 
                         if val == "LUNCH BREAK" or val == "BREAK":
@@ -193,7 +198,7 @@ class PreviewView(QWidget):
                 table.verticalHeader().setVisible(True)
                 table.setAlternatingRowColors(False)
                 table.setSelectionMode(QTableWidget.ExtendedSelection)
-                table.setEditTriggers(QTableWidget.DoubleClicked)
+                table.setEditTriggers(QTableWidget.NoEditTriggers)
 
                 table.setStyleSheet(f"""
                     QTableWidget {{
@@ -216,6 +221,7 @@ class PreviewView(QWidget):
                 self.tab_widget.addTab(table, sheet_name)
 
             self.content_layout.addWidget(self.tab_widget)
+            self.tab_widget.setCurrentIndex(current_index)
             self.swap_btn.setEnabled(True)
 
             self.val_banner.setText("✅ Schedule Verified — 0 Hard Constraint Violations.")
@@ -224,9 +230,10 @@ class PreviewView(QWidget):
 
         except Exception as e:
             self._show_error(f"Error loading preview: {str(e)}")
+            raise
 
     def _swap_selected(self):
-        """Swaps the text content of two selected cells in the current tab."""
+        """Apply a validated change to the model and refresh every view."""
         if not hasattr(self, 'tab_widget') or not self.tables: return
 
         current_table = self.tables[self.tab_widget.currentIndex()]
@@ -238,53 +245,22 @@ class PreviewView(QWidget):
 
         item1, item2 = selected_items[0], selected_items[1]
 
-        if "BREAK" in item1.text() or "BREAK" in item2.text():
+        if any(current_table.horizontalHeaderItem(item.column()).text() == "BREAK" for item in (item1, item2)):
             QMessageBox.warning(self, "Cannot Swap Break", "You cannot swap a lunch break period.")
             return
 
-        text1 = item1.text()
-        text2 = item2.text()
+        def slot(item):
+            day = current_table.verticalHeaderItem(item.row()).text()
+            period = int(current_table.horizontalHeaderItem(item.column()).text().split()[-1])
+            return day, period
 
-        item1.setText(text2)
-        item2.setText(text1)
-
-        current_table.clearSelection()
-
-        self.val_banner.setText("⚠️ Manual edit applied. Independent Validator active.")
-        self.val_banner.setStyleSheet("background-color: #FEF3C7; color: #92400E; padding: 8px 12px; border-radius: 6px;")
-        self.val_banner.show()
-
-    def get_current_data_as_excel(self):
-        """Reads modified tables back into a new excel file and returns the path."""
-        if not self.tables:
-            return None
-
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.xlsx')
-        os.close(tmp_fd)
-
-        with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
-            for i in range(self.tab_widget.count()):
-                sheet_name = self.tab_widget.tabText(i)
-                table = self.tables[i]
-
-                rows = table.rowCount()
-                cols = table.columnCount()
-
-                col_headers = [table.horizontalHeaderItem(c).text() for c in range(cols)]
-                row_headers = [table.verticalHeaderItem(r).text() for r in range(rows)]
-
-                data = []
-                for r in range(rows):
-                    row_data = []
-                    for c in range(cols):
-                        item = table.item(r, c)
-                        row_data.append(item.text() if item else "")
-                    data.append(row_data)
-
-                df = pd.DataFrame(data, columns=col_headers, index=row_headers)
-                df.to_excel(writer, sheet_name=sheet_name)
-
-        return tmp_path
+        index = self.tab_widget.currentIndex()
+        try:
+            self.document.swap(*self.view_keys[index], slot(item1), slot(item2))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot Apply Change", str(exc))
+            return
+        self._render(index)
 
     def _show_error(self, message: str):
         """Show error message."""

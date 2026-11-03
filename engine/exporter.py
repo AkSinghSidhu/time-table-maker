@@ -1,4 +1,7 @@
 import pandas as pd
+import os
+import re
+import tempfile
 from engine.logger import log_step, log_info, log_success
 
 class TimetableExporter:
@@ -74,16 +77,45 @@ class TimetableExporter:
         return class_grids, teacher_grids
 
     @staticmethod
+    def named_grids(class_grids, teacher_grids):
+        """Return Excel-safe, case-insensitively unique names for every view."""
+        used = set()
+        named = []
+        for prefix, grids in (("Class_", class_grids), ("Tr_", teacher_grids)):
+            for key, grid in grids.items():
+                base = re.sub(r"[\\/*?:\[\]\x00-\x1f]", "_", prefix + str(key)).strip("'")
+                name = base[:31].rstrip("'")
+                suffix = 1
+                while name.casefold() in used:
+                    tag = f"_{suffix}"
+                    name = base[:31 - len(tag)] + tag
+                    suffix += 1
+                used.add(name.casefold())
+                named.append((name, grid))
+        return named
+
+    @staticmethod
     def export_excel(class_grids, teacher_grids, output_path):
         log_step("💾 Step 7: Exporting Schedule to Excel Workbook", output_path)
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            for c_id, df in class_grids.items():
-                sheet_name = f"Class_{c_id}"[:31]
-                df.to_excel(writer, sheet_name=sheet_name)
-
-            for t_id, df in teacher_grids.items():
-                sheet_name = f"Tr_{t_id}"[:31]
-                df.to_excel(writer, sheet_name=sheet_name)
+        named = TimetableExporter.named_grids(class_grids, teacher_grids)
+        if not named:
+            raise ValueError("There are no timetable views to export.")
+        destination = os.path.abspath(output_path)
+        fd, temporary = tempfile.mkstemp(suffix=".xlsx", dir=os.path.dirname(destination))
+        os.close(fd)
+        try:
+            with pd.ExcelWriter(temporary, engine="openpyxl") as writer:
+                for sheet_name, df in named:
+                    df.to_excel(writer, sheet_name=sheet_name)
+                    # Timetable labels are text, even when an imported name starts with '='.
+                    for row in writer.sheets[sheet_name].iter_rows():
+                        for cell in row:
+                            if cell.data_type == "f":
+                                cell.data_type = "s"
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
         log_success(f"Workbook successfully exported to {output_path}")
         return output_path

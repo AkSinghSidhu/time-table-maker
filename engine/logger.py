@@ -27,4 +27,4 @@ def log_warning(message):
 def log_error(message):
     """Prints error line to terminal."""
     now = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] ❌ {message}", sys.stderr, flush=True)
+    print(f"[{now}] ❌ {message}", file=sys.stderr, flush=True)

@@ -2,6 +2,7 @@
 
 import sys
 import time
+import argparse
 
 from engine.data_loader import load_timetable_data
 from engine.validator import PreSolverValidator, IndependentValidator
@@ -19,12 +20,17 @@ def main(path="Time Table (Aug-Dec) 2026 - TOOL FORMAT.xlsx", time_limit=60):
         print("\n*** VALIDATION FAILED ***")
         for e in errors:
             print("  -", e)
-        sys.exit(1)
+        return 1
 
     solver = TimetableCPSATSolver(data)
     schedule = solver.solve(time_limit_seconds=time_limit)
 
-    IndependentValidator.validate_schedule(schedule, data)
+    violations = IndependentValidator.validate_schedule(schedule, data)
+    if violations:
+        print("\n*** POST-SOLVER VALIDATION FAILED ***")
+        for violation in violations:
+            print("  -", violation)
+        return 1
 
     # quick summary
     from collections import Counter
@@ -38,7 +44,20 @@ def main(path="Time Table (Aug-Dec) 2026 - TOOL FORMAT.xlsx", time_limit=60):
         print(f"  {t:6} {n:3}")
     print(f"\nTotal schedule entries: {len(schedule)} "
           f"(elapsed pipeline time {time.time() - t0:.1f}s)")
+    return 0
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("workbook", nargs="?", default="Time Table (Aug-Dec) 2026 - TOOL FORMAT.xlsx")
+    parser.add_argument("time_limit", nargs="?", type=float, default=60, help="Solver time limit in seconds")
+    args = parser.parse_args()
+    try:
+        result = main(args.workbook, args.time_limit)
+    except Exception as exc:
+        print(f"Check failed: {exc}", file=sys.stderr)
+        result = 1
+    sys.exit(result)
